@@ -1,0 +1,1 @@
+setup/terraform/.terraform/ setup/terraform/*.tfstate setup/terraform/*.tfstate.backup setup/terraform/.terraform.lock.hcl node_modules/ __pycache__/ *.pyc
