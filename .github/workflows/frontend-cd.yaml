@@ -1,0 +1,144 @@
+name: Frontend Continuous Deployment
+
+# Automatically triggered on pushes/merges to main, only for frontend changes.
+# Can also be run manually (on-demand) for verification.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'starter/frontend/**'
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18.x'
+  FRONTEND_DIR: starter/frontend
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: cluster
+  ECR_REPOSITORY: frontend
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # LINT JOB
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FRONTEND_DIR }}/node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('starter/frontend/package-lock.json') }}
+          restore-keys: |
+            node-modules-${{ runner.os }}-
+
+      - name: Install dependencies
+        working-directory: ${{ env.FRONTEND_DIR }}
+        run: npm ci
+
+      - name: Run lint
+        working-directory: ${{ env.FRONTEND_DIR }}
+        run: npm run lint
+
+  # ---------------------------------------------------------------------------
+  # TEST JOB
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FRONTEND_DIR }}/node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('starter/frontend/package-lock.json') }}
+          restore-keys: |
+            node-modules-${{ runner.os }}-
+
+      - name: Install dependencies
+        working-directory: ${{ env.FRONTEND_DIR }}
+        run: npm ci
+
+      - name: Run tests
+        working-directory: ${{ env.FRONTEND_DIR }}
+        run: CI=true npm test
+
+  # ---------------------------------------------------------------------------
+  # BUILD & DEPLOY JOB - only runs after lint AND test succeed (needs)
+  # ---------------------------------------------------------------------------
+  build-and-deploy:
+    name: Build and Deploy
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Credentials come ONLY from GitHub Secrets - never hard-coded.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Configure kubeconfig so we can resolve the backend service URL and deploy.
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      # Discover the backend external URL so the frontend is built pointing at it.
+      - name: Get backend API URL
+        id: backend-url
+        run: |
+          BACKEND_HOST=$(kubectl get svc backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          if [ -z "$BACKEND_HOST" ]; then
+            # Fallback to local default if the backend service is not yet reachable
+            echo "api_url=http://localhost:5000" >> "$GITHUB_OUTPUT"
+          else
+            echo "api_url=http://$BACKEND_HOST" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Build the image tagged with the git sha (from the GitHub context) and
+      # pass the backend URL as a build-arg via the REACT_APP_MOVIE_API_URL env var.
+      - name: Build and push Docker image to ECR
+        working-directory: ${{ env.FRONTEND_DIR }}
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          REACT_APP_MOVIE_API_URL: ${{ steps.backend-url.outputs.api_url }}
+        run: |
+          docker build \
+            --build-arg=REACT_APP_MOVIE_API_URL=$REACT_APP_MOVIE_API_URL \
+            --tag=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      # Set the image tag in the kustomize manifests and apply to the cluster.
+      - name: Deploy to EKS
+        working-directory: ${{ env.FRONTEND_DIR }}/k8s
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          kustomize edit set image frontend=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          kustomize build | kubectl apply -f -

@@ -1,0 +1,133 @@
+name: Backend Continuous Deployment
+
+# Automatically triggered on pushes/merges to main, only for backend changes.
+# Can also be run manually (on-demand) for verification.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'starter/backend/**'
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.10'
+  BACKEND_DIR: starter/backend
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: cluster
+  ECR_REPOSITORY: backend
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # LINT JOB
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pipenv virtualenv
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/virtualenvs
+          key: pipenv-${{ runner.os }}-${{ hashFiles('starter/backend/Pipfile.lock') }}
+          restore-keys: |
+            pipenv-${{ runner.os }}-
+
+      - name: Install pipenv
+        run: pip install pipenv
+
+      - name: Install dependencies
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: pipenv install --dev
+
+      - name: Run lint
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: pipenv run lint
+
+  # ---------------------------------------------------------------------------
+  # TEST JOB
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pipenv virtualenv
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/virtualenvs
+          key: pipenv-${{ runner.os }}-${{ hashFiles('starter/backend/Pipfile.lock') }}
+          restore-keys: |
+            pipenv-${{ runner.os }}-
+
+      - name: Install pipenv
+        run: pip install pipenv
+
+      - name: Install dependencies
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: pipenv install --dev
+
+      - name: Run tests
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: pipenv run test
+
+  # ---------------------------------------------------------------------------
+  # BUILD & DEPLOY JOB - only runs after lint AND test succeed (needs)
+  # ---------------------------------------------------------------------------
+  build-and-deploy:
+    name: Build and Deploy
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Credentials come ONLY from GitHub Secrets - never hard-coded.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build the image tagged with the git sha (from the GitHub context) and push to ECR.
+      - name: Build and push Docker image to ECR
+        working-directory: ${{ env.BACKEND_DIR }}
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build --tag=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      # Set the image tag in the kustomize manifests and apply to the cluster.
+      - name: Deploy to EKS
+        working-directory: ${{ env.BACKEND_DIR }}/k8s
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          kustomize edit set image backend=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          kustomize build | kubectl apply -f -
