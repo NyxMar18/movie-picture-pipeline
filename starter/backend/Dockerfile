@@ -12,12 +12,12 @@ RUN apk update && \
   linux-headers \
   openssl \
   libffi-dev \
-  && pip install pipenv
+  && pip install pipenv==2023.7.23
 
 RUN mkdir -p /var/www/app && mkdir /app
 
 COPY Pipfile* /app
-RUN cd /app && pipenv install --system --deploy
+RUN cd /app && CFLAGS=" -Wno-error=incompatible-pointer-types" pipenv install --system --deploy
 
 COPY . /app
 
